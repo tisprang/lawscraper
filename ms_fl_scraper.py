@@ -727,7 +727,11 @@ def scrape_section(
 
         for j in range(nested_count):
             n_item = nested_items.nth(j)
-            n_btn = n_item.locator("button.fl-accordion-button")
+            n_btn = n_item.locator(
+                ":scope > h2 .fl-accordion-button, "
+                ":scope > h3 .fl-accordion-button, "
+                ":scope > button.fl-accordion-button"
+            ).first
             try:
                 n_btn.wait_for(state="attached", timeout=3000)
             except Exception:
@@ -735,7 +739,7 @@ def scrape_section(
 
             # label for this node
             try:
-                label = n_btn.locator(".fl-text-left").inner_text(timeout=2000).strip()
+                label = n_btn.locator(".fl-text-left").first.inner_text(timeout=2000).strip()
             except Exception:
                 label = f"Section {j+1}"
 
@@ -1150,7 +1154,13 @@ def fetch_leaf_threadsafe(
             time.sleep(1.5 * (attempt + 1) + random.random())
     return
 
-async def scrape_section_url_async(section_url: str, state: str, output_file: str) -> None:
+async def scrape_section_url_async(
+    section_url: str,
+    state: str,
+    output_file: str,
+    *,
+    require_complete_tree: bool = True,
+) -> None:
     from queue import Queue
     from threading import Thread
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -1178,6 +1188,15 @@ async def scrape_section_url_async(section_url: str, state: str, output_file: st
 
     futures_list = []
     executor = ThreadPoolExecutor(max_workers=8)
+    writer_closed = False
+
+    def _close_writer_once():
+        nonlocal writer_closed
+        if writer_closed:
+            return
+        record_q.put(None)
+        writer_t.join()
+        writer_closed = True
     profile_dir = os.path.join("findlaw_codes", "playwright_profile")
 
     async with async_playwright() as p:
@@ -1191,17 +1210,26 @@ async def scrape_section_url_async(section_url: str, state: str, output_file: st
 
         print(f"Loading {section_url} ...")
         await page.goto(section_url, wait_until="domcontentloaded", timeout=60000)
-        found_tree = False
-        for _ in range(12):
-            if await page.locator(".fl-expandable-tree-accordion > .fl-accordion-item").count() > 0:
-                found_tree = True
-                break
-            await page.wait_for_timeout(5000)
+        found_tree = await _wait_for_findlaw_ready_async(
+            page,
+            section_url,
+            tree_selector=".fl-expandable-tree-accordion > .fl-accordion-item",
+            timeout_ms=240000,
+        )
         if not found_tree:
             raise RuntimeError(f"Accordion tree not visible for {section_url}")
 
         # Collect all leaf links by expanding accordions
-        work = await _collect_links_async(page, section_url, [state.upper()], [1])
+        work = await _collect_links_async(
+            page,
+            section_url,
+            [state.upper()],
+            [1],
+            max_collect_seconds=None if require_complete_tree else 300.0,
+            require_complete_tree=require_complete_tree,
+        )
+        if not work:
+            raise RuntimeError(f"No statute links found after expanding accordions for {section_url}")
         print(f"Found {len(work)} statutes. Fetching...")
 
         # If the first leaf is blocked, switch the whole run to Playwright-only.
@@ -1210,8 +1238,7 @@ async def scrape_section_url_async(section_url: str, state: str, output_file: st
         try:
             probe_response = probe_session.get(work[0][1], timeout=30)
             if probe_response.status_code != 200 or _is_blocked_findlaw_response(probe_response.text):
-                record_q.put(None)
-                writer_t.join()
+                _close_writer_once()
                 if os.path.exists(output_file) and os.path.getsize(output_file) == 0:
                     os.remove(output_file)
                 await _scrape_leafs_with_playwright_fallback_async(page, work, state, output_file, section_url)
@@ -1235,8 +1262,9 @@ async def scrape_section_url_async(section_url: str, state: str, output_file: st
         pass
     executor.shutdown(wait=True)
 
-    record_q.put(None)
-    writer_t.join()
+    _close_writer_once()
+    if os.path.exists(output_file) and os.path.getsize(output_file) == 0:
+        os.remove(output_file)
     print(f"Done. Saved to {output_file}")
 
 
@@ -1261,15 +1289,277 @@ async def _wait_links_or_subaccordions_async(scope, timeout=8000):
         return False
 
 
-async def _collect_links_async(page, section_url: str, base_path: list, base_lex: list) -> list:
+async def _wait_for_findlaw_ready_async(page, section_url: str, tree_selector: str, timeout_ms: int = 180000) -> bool:
+    """
+    Wait until Cloudflare challenge is cleared and the accordion tree is visible.
+    This avoids closing the browser while FindLaw is still on verification pages.
+    """
+    deadline = time.time() + (timeout_ms / 1000.0)
+    challenge_markers = (
+        "just a moment",
+        "checking your browser",
+        "verify you are human",
+        "performing security verification",
+        "cloudflare",
+    )
+    last_log_ts = 0.0
+
+    while time.time() < deadline:
+        try:
+            if await page.locator(tree_selector).count() > 0:
+                return True
+        except Exception:
+            pass
+
+        try:
+            body_text = (await page.locator("body").inner_text(timeout=2000)).lower()
+        except Exception:
+            body_text = ""
+
+        current_url = page.url or ""
+        in_challenge = (
+            "cdn-cgi/challenge" in current_url.lower()
+            or any(marker in body_text for marker in challenge_markers)
+        )
+
+        # Keep the same target page loaded while CF finishes; do not race ahead.
+        if not in_challenge and current_url and current_url != section_url:
+            try:
+                await page.goto(section_url, wait_until="domcontentloaded", timeout=60000)
+            except Exception:
+                pass
+
+        now = time.time()
+        if now - last_log_ts > 12:
+            status = "Cloudflare challenge" if in_challenge else "content loading"
+            print(f"Waiting for FindLaw page readiness ({status}) ...")
+            last_log_ts = now
+
+        await page.wait_for_timeout(2000)
+
+    return False
+
+
+async def _expand_all_accordions_async(
+    page,
+    max_passes: int = 180,
+    time_budget_s: Optional[float] = 45.0,
+    stable_rounds_target: int = 8,
+) -> bool:
+    """Expand many accordion nodes per pass to reduce total wall-clock time.
+
+    Returns True when expansion likely stabilized, False when stopped by time budget.
+    """
+    start_ts = time.time()
+    has_budget = time_budget_s is not None
+    stable_rounds = 0
+    for _ in range(max_passes):
+        if has_budget and (time.time() - start_ts) >= max(1.0, float(time_budget_s)):
+            print("Accordion bulk-expand time budget reached; continuing with partial expansion.")
+            return False
+
+        clicked = await page.evaluate(
+            """
+            () => {
+              const selectors = [
+                'button.fl-accordion-button[aria-expanded="false"]',
+                'button.fl-accordion-button:not([aria-expanded])'
+              ];
+              const buttons = Array.from(document.querySelectorAll(selectors.join(',')));
+              let clicked = 0;
+              const batch = 120;
+              for (const btn of buttons.slice(0, batch)) {
+                try {
+                  btn.scrollIntoView({ block: 'center', inline: 'nearest' });
+                  btn.click();
+                  clicked += 1;
+                } catch (_e) {
+                }
+              }
+              return clicked;
+            }
+            """
+        )
+
+        if clicked > 0:
+            stable_rounds = 0
+            # Give the page time to inject deeper lazy-loaded accordion levels.
+            await page.wait_for_timeout(700)
+            continue
+
+        did_scroll = await page.evaluate(
+            """
+            () => {
+              const before = window.scrollY;
+              const viewport = window.innerHeight || 1000;
+              window.scrollBy(0, Math.max(600, Math.floor(viewport * 0.85)));
+              const after = window.scrollY;
+              const maxScroll = Math.max(0, document.body.scrollHeight - viewport);
+              return { moved: after > before, atBottom: after >= maxScroll - 3 };
+            }
+            """
+        )
+
+        await page.wait_for_timeout(700)
+        if did_scroll.get("moved"):
+            continue
+
+        if did_scroll.get("atBottom"):
+            stable_rounds += 1
+            # At bottom, run a few extra settling rounds to catch delayed nested nodes.
+            if stable_rounds >= max(2, int(stable_rounds_target)):
+                break
+
+    return True
+
+
+async def _get_accordion_stats_async(page) -> Dict[str, int]:
+    stats = await page.evaluate(
+        """
+        () => {
+          const allButtons = Array.from(document.querySelectorAll('button.fl-accordion-button'));
+          const closedButtons = allButtons.filter(btn => (btn.getAttribute('aria-expanded') || '').toLowerCase() !== 'true');
+          const links = Array.from(document.querySelectorAll('.fl-recursive-tree-accordion a[href]'));
+          return {
+            total_buttons: allButtons.length,
+            closed_buttons: closedButtons.length,
+            visible_links: links.length,
+          };
+        }
+        """
+    )
+    return {
+        "total_buttons": int(stats.get("total_buttons", 0)),
+        "closed_buttons": int(stats.get("closed_buttons", 0)),
+        "visible_links": int(stats.get("visible_links", 0)),
+    }
+
+
+async def _force_click_closed_accordions_async(page, limit: int = 25) -> int:
+    """Fallback for cases where JS batch clicking plateaus although closed buttons remain."""
+    closed_buttons = page.locator('button.fl-accordion-button[aria-expanded="false"]')
+    try:
+        count = await closed_buttons.count()
+    except Exception:
+        return 0
+
+    clicked = 0
+    for idx in range(min(count, max(1, int(limit)))):
+        btn = closed_buttons.nth(idx)
+        try:
+            await btn.scroll_into_view_if_needed(timeout=4000)
+            await btn.click(timeout=4000)
+            clicked += 1
+            await page.wait_for_timeout(150)
+        except Exception:
+            continue
+    return clicked
+
+
+async def _collect_links_async(
+    page,
+    section_url: str,
+    base_path: list,
+    base_lex: list,
+    max_collect_seconds: Optional[float] = 300.0,
+    require_complete_tree: bool = False,
+) -> list:
     """Expand all accordions and collect (name, url, path, lex) tuples."""
     from urllib.parse import urljoin
     results = []
+    deadline_ts = None
+    if max_collect_seconds is not None:
+        deadline_ts = time.time() + max(10.0, float(max_collect_seconds))
+
+    # In completeness mode, loop expand+collect until URL set stabilizes.
+    if require_complete_tree:
+        seen_urls = set()
+        stable_rounds = 0
+        round_idx = 0
+        previous_closed_buttons = None
+        while True:
+            round_idx += 1
+            await _expand_all_accordions_async(
+                page,
+                max_passes=260,
+                time_budget_s=None,
+                stable_rounds_target=14,
+            )
+
+            stats_after_expand = await _get_accordion_stats_async(page)
+            if stats_after_expand["closed_buttons"] > 0:
+                forced_clicks = await _force_click_closed_accordions_async(page, limit=30)
+                if forced_clicks > 0:
+                    await page.wait_for_timeout(1200)
+                    stats_after_expand = await _get_accordion_stats_async(page)
+
+            round_links = []
+            items = page.locator(".fl-expandable-tree-accordion > .fl-accordion-item")
+            count = await items.count()
+            for i in range(count):
+                item = items.nth(i)
+                btn = item.locator(":scope > h2 .fl-accordion-button")
+                await btn.wait_for(state="attached", timeout=15000)
+
+                try:
+                    top_label = await btn.locator(".fl-text-left").inner_text(timeout=3000)
+                    top_label = top_label.strip()
+                except Exception:
+                    top_label = f"Section {i+1}"
+
+                if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
+                    await btn.click()
+
+                await _wait_links_or_subaccordions_async(item, timeout=8000)
+                round_links.extend(
+                    await _collect_recursive_async(
+                        item,
+                        section_url,
+                        base_path + [top_label],
+                        base_lex + [i + 1],
+                        None,
+                    )
+                )
+
+            current_urls = {u for _, u, _, _ in round_links}
+            new_urls = len(current_urls - seen_urls)
+            closed_buttons = stats_after_expand["closed_buttons"]
+            print(
+                f"Collect round {round_idx}: {len(current_urls)} unique links ({new_urls} new), {closed_buttons} closed accordion buttons left."
+            )
+
+            no_progress = new_urls == 0
+            if previous_closed_buttons is not None and closed_buttons < previous_closed_buttons:
+                no_progress = False
+
+            if no_progress and closed_buttons == 0:
+                stable_rounds += 1
+            else:
+                stable_rounds = 0
+
+            seen_urls = current_urls
+            results = round_links
+            previous_closed_buttons = closed_buttons
+
+            if stable_rounds >= 2:
+                print("Link set stabilized. Proceeding to fetch all collected statutes.")
+                return results
+
+    # Timed mode for non-strict runs.
+    await _expand_all_accordions_async(page, max_passes=120, time_budget_s=35.0)
+
+    if deadline_ts is not None and time.time() >= deadline_ts:
+        print("Link collection deadline reached before traversal started.")
+        return results
 
     items = page.locator(".fl-expandable-tree-accordion > .fl-accordion-item")
     count = await items.count()
 
     for i in range(count):
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            print("Link collection deadline reached; starting fetch with partial link set.")
+            break
+
         item = items.nth(i)
         btn = item.locator(":scope > h2 .fl-accordion-button")
         await btn.wait_for(state="attached", timeout=10000)
@@ -1283,19 +1573,44 @@ async def _collect_links_async(page, section_url: str, base_path: list, base_lex
         if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
             await btn.click()
 
-        await _wait_links_or_subaccordions_async(item, timeout=8000)
+        if deadline_ts is None:
+            wait_ms = 6000
+        else:
+            wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
+        await _wait_links_or_subaccordions_async(item, timeout=wait_ms)
 
-        results.extend(await _collect_recursive_async(item, section_url, base_path + [top_label], base_lex + [i+1]))
+        results.extend(
+            await _collect_recursive_async(
+                item,
+                section_url,
+                base_path + [top_label],
+                base_lex + [i + 1],
+                deadline_ts,
+            )
+        )
 
     return results
 
 
-async def _collect_recursive_async(scope, section_url: str, base_path: list, base_lex: list) -> list:
+async def _collect_recursive_async(
+    scope,
+    section_url: str,
+    base_path: list,
+    base_lex: list,
+    deadline_ts: Optional[float],
+) -> list:
     from urllib.parse import urljoin
     results = []
 
+    if deadline_ts is not None and time.time() >= deadline_ts:
+        return results
+
     # If content is still loading, wait briefly before counting.
-    await _wait_links_or_subaccordions_async(scope, timeout=8000)
+    if deadline_ts is None:
+        wait_ms = 6000
+    else:
+        wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
+    await _wait_links_or_subaccordions_async(scope, timeout=wait_ms)
 
     # Case A: direct links
     link_list = scope.locator(
@@ -1319,16 +1634,31 @@ async def _collect_recursive_async(scope, section_url: str, base_path: list, bas
     )
     nested_count = await nested_items.count()
 
+    # Some branches render one level later; retry once before concluding this node is a leaf.
+    if direct_count == 0 and nested_count == 0:
+        if deadline_ts is None:
+            wait_ms = 6000
+        else:
+            wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
+        await _wait_links_or_subaccordions_async(scope, timeout=wait_ms)
+        direct_count = await link_list.count()
+        nested_count = await nested_items.count()
+
     for j in range(nested_count):
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            break
+
         n_item = nested_items.nth(j)
-        n_btn = n_item.locator("button.fl-accordion-button")
-        try:
-            await n_btn.wait_for(state="attached", timeout=3000)
-        except Exception:
+        n_btn = n_item.locator(
+            ":scope > h2 .fl-accordion-button, "
+            ":scope > h3 .fl-accordion-button, "
+            ":scope > button.fl-accordion-button"
+        ).first
+        if await n_btn.count() == 0:
             continue
 
         try:
-            label = await n_btn.locator(".fl-text-left").inner_text(timeout=2000)
+            label = await n_btn.locator(".fl-text-left").first.inner_text(timeout=2000)
             label = label.strip()
         except Exception:
             label = f"Section {j+1}"
@@ -1336,18 +1666,21 @@ async def _collect_recursive_async(scope, section_url: str, base_path: list, bas
         if (await n_btn.get_attribute("aria-expanded") or "").lower() != "true":
             await n_btn.click()
 
-        # NEU: aktiv auf Links oder weitere nested items warten statt fixed timeout
-        try:
-            await n_item.locator(
-                ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
-                ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
-            ).first.wait_for(state="attached", timeout=8000)
-        except Exception:
-            pass
+        if deadline_ts is None:
+            wait_ms = 6000
+        else:
+            wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
+        await _wait_links_or_subaccordions_async(n_item, timeout=wait_ms)
 
-        results.extend(await _collect_recursive_async(
-            n_item, section_url, base_path + [label], base_lex + [j+1]
-        ))
+        results.extend(
+            await _collect_recursive_async(
+                n_item,
+                section_url,
+                base_path + [label],
+                base_lex + [j + 1],
+                deadline_ts,
+            )
+        )
 
     return results
 
