@@ -3,12 +3,23 @@ import json
 import os
 from io import TextIOWrapper
 
-import requests
+from playwright.sync_api import sync_playwright, Browser
 from bs4 import BeautifulSoup, PageElement
 from tqdm import tqdm
 
 from scraper_utils import (CODES_BASE_URL, FAILED_FAILPATH, HEADERS,
                            JUR_URL_MAP, JUSTIA_BASE_URL, REGULATIONS_BASE_URL)
+
+def fetch_html(browser: Browser, url: str) -> str | None:
+    try:
+        page = browser.new_page()
+        page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        content = page.content()
+        page.close()
+        return content
+    except Exception as e:
+        print(f"Playwright error for {url}: {e}")
+        return None
 
 
 def extract_links_from_content(content: PageElement) -> list:
@@ -35,7 +46,7 @@ def extract_links_from_content(content: PageElement) -> list:
 
 
 def process_code_leaf(
-    state_name: str, url: str, jsonl_fp: TextIOWrapper | None, is_reg: bool = False
+    state_name: str, url: str, jsonl_fp: TextIOWrapper | None, browser: Browser, is_reg: bool = False
 ) -> dict:
     """
     Process the content of a leaf node in the Justia website.
@@ -48,9 +59,9 @@ def process_code_leaf(
     Returns:
     - dict: A dictionary containing the title and content of the leaf node.
     """
-    response = requests.get(url, headers=HEADERS)
-    if response.status_code == 200:
-        soup: BeautifulSoup = BeautifulSoup(response.content, "html.parser")
+    html = fetch_html(browser, url)
+    if html:
+        soup: BeautifulSoup = BeautifulSoup(html, "html.parser")
         # title = soup.find('h1').get_text(strip=True)
         sep = soup.find("span", class_="breadcrumb-sep").get_text(strip=True)
         assert ord(sep) == 8250, "Separator is not the right character."
@@ -89,9 +100,7 @@ def process_code_leaf(
             jsonl_fp.write(json.dumps(record))
             jsonl_fp.write("\n")
     else:
-        print(
-            f"Failed to retrieve content for {url}, Status Code: {response.status_code}"
-        )
+        print(f"Failed to retrieve content for {url}")
         with open(FAILED_FAILPATH, "a") as f:
             f.write(f"{url}\n")
 
@@ -105,47 +114,33 @@ def collect_leaf_urls(
     regs: bool = False,
     write_jsonl=True,
 ) -> list:
-    """
-    Collect all leaf URLs from the given site URL.
-
-    Args:
-    - state_name (str): The state code to scrape.
-    - init_url (str): The initial URL to start scraping from.
-    - site_url (str): The base URL of the site.
-    - internal_class (str): A class name which contains the internal links. Leaf nodes will not have this class.
-    - jsonl_fp (TextIOWrapper): The file pointer to write the JSONL records to.
-    - regs (bool): Whether to scrape the regulations instead of the codes.
-    - write_jsonl (bool): Whether to write the JSONL records to the file.
-
-    Returns:
-    - List[str]: A list of all leaf URLs.
-    """
     collected_urls = []
 
-    def helper(url: str):
-        response = requests.get(url, headers=HEADERS)
-        if response.status_code == 200:
-            soup: BeautifulSoup = BeautifulSoup(response.content, "html.parser")
-            internal_links = soup.find(
-                class_=internal_class
-            )  # these will be URLs relative to the base_url
-            if internal_links:
-                internal_links = extract_links_from_content(internal_links)
-                for link in internal_links:
-                    href = link["href"]
-                    helper(f"{site_url}{href}")
-            else:
-                collected_urls.append(url)
-                print(url)
-                leaf_record = process_code_leaf(state_name, url, jsonl_fp, regs)
-        else:
-            print(
-                f"Failed to retrieve content for {url}, Status Code: {response.status_code}"
-            )
-            with open(FAILED_FAILPATH, "a") as f:
-                f.write(f"{url}\n")
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
 
-    helper(init_url)
+        def helper(url: str):
+            html = fetch_html(browser, url)
+            if html:
+                soup = BeautifulSoup(html, "html.parser")
+                internal_links = soup.find(class_=internal_class)
+                if internal_links:
+                    internal_links = extract_links_from_content(internal_links)
+                    for link in internal_links:
+                        href = link["href"]
+                        helper(f"{site_url}{href}")
+                else:
+                    collected_urls.append(url)
+                    print(url)
+                    process_code_leaf(state_name, url, jsonl_fp, browser, regs)
+            else:
+                print(f"Failed to retrieve content for {url}")
+                with open(FAILED_FAILPATH, "a") as f:
+                    f.write(f"{url}\n")
+
+        helper(init_url)
+        browser.close()
+
     return collected_urls
 
 

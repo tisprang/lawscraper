@@ -14,7 +14,7 @@ import re
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -46,6 +46,126 @@ def _chunk_list(seq, n):
         if start < end:
             yield seq[start:end]
         start = end
+
+def clean_paragraphs(soup):
+    paragraphs = []
+    for p in soup.select("div.codes-content p"):
+        text = p.get_text(" ", strip=True)          # Whitespace kollabieren
+        text = re.sub(r" {2,}", " ", text)           # mehrfache Spaces entfernen
+        text = re.sub(r"\n+", " ", text)             # Zeilenbrüche innerhalb eines p entfernen
+        if text.lower().startswith("cite this article"):  # Zitationshinweis rausfiltern
+            continue
+        paragraphs.append(text)
+    return "\n\n".join(paragraphs)
+
+
+NODE_KIND_PATTERNS = [
+    (r"^title\b", "title"),
+    (r"^subtitle\b", "subtitle"),
+    (r"^chapter\b", "chapter"),
+    (r"^subchapter\b", "subchapter"),
+    (r"^article\b", "article"),
+    (r"^part\b", "part"),
+    (r"^division\b", "division"),
+    (r"^subdivision\b", "subdivision"),
+    (r"^section\b", "section_group"),
+    (r"^rule\b", "rule_group"),
+]
+
+
+def _guess_node_kind(label: str, level: int) -> str:
+    txt = (label or "").strip().lower()
+    if level == 0 and re.fullmatch(r"[a-z]{2}", txt):
+        return "state"
+    for pattern, kind in NODE_KIND_PATTERNS:
+        if re.match(pattern, txt):
+            return kind
+    if "constitution" in txt:
+        return "constitution"
+    return "node"
+
+
+def _parse_statute_heading(heading: str, fallback_label: str = "") -> Dict[str, str]:
+    """
+    Parse statute heading text from <h1> into structured parts.
+
+    Example input:
+    "Washington Revised Code Title 29A. Elections § 29A.04.001. Scope of definitions"
+    """
+    raw = (heading or "").strip()
+    out = {
+        "heading": raw,
+        "article_code": "",
+        "article_title": "",
+    }
+    if not raw:
+        return out
+
+    m = re.search(
+        r"(?:§|\uFFFD|section\s+|sec\.\s*)([^\.\s]+(?:\.[^\.\s]+)*)\.?\s*(.*)$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        out["article_code"] = m.group(1).strip()
+        out["article_title"] = m.group(2).strip(" .")
+        return out
+
+    # Generic fallback for headings that don't include §: use last sentence fragment.
+    parts = [p.strip() for p in raw.split(".") if p.strip()]
+    if len(parts) >= 2:
+        out["article_title"] = parts[-1]
+    else:
+        out["article_title"] = raw
+    out["article_code"] = (fallback_label or "").strip()
+    return out
+
+
+def _build_hierarchy_metadata(
+    path_so_far: List[str],
+    lex_path: List[int],
+    state: str,
+    *,
+    leaf_title: str = "",
+    leaf_heading: str = "",
+    leaf_code: str = "",
+) -> Dict[str, Any]:
+    nodes: List[Dict[str, Any]] = []
+    for i, label in enumerate(path_so_far):
+        nodes.append(
+            {
+                "level": i,
+                "label": label,
+                "kind": _guess_node_kind(label, i),
+                "lex_index": lex_path[i] if i < len(lex_path) else None,
+            }
+        )
+
+    parent_nodes = nodes[:-1] if len(nodes) > 1 else []
+    leaf_node = nodes[-1] if nodes else None
+    if leaf_node is not None:
+        if leaf_title:
+            leaf_node["title"] = leaf_title
+        if leaf_heading:
+            leaf_node["heading"] = leaf_heading
+        if leaf_code:
+            leaf_node["code"] = leaf_code
+
+    slots: Dict[str, str] = {}
+    for n in parent_nodes:
+        k = n["kind"]
+        if k not in ("node", "state") and k not in slots:
+            slots[k] = n["label"]
+
+    return {
+        "schema": "findlaw_hierarchy_v1",
+        "state": state.upper(),
+        "path_nodes": path_so_far,
+        "path_depth": len(path_so_far),
+        "parent_nodes": parent_nodes,
+        "leaf_node": leaf_node,
+        "slots": slots,
+    }
 
 
 def _worker_scrape_sections(
@@ -508,7 +628,10 @@ def _wait_links_or_subaccordions(scope, timeout=6000):
     Wait (briefly) for either links (leaves) or nested accordion-items to appear under `scope`.
     Returns True if something is present/attaches, False on soft-timeout.
     """
-    sel = ".fl-recursive-tree-accordion a[href], .fl-recursive-tree-accordion-list .fl-accordion .fl-accordion-item"
+    sel = (
+        ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
+        ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+    )
     # fast path: anything already there?
     try:
         if scope.locator(sel).count() > 0:
@@ -563,14 +686,17 @@ def scrape_section(
         # If nothing is present yet, wait briefly for either links or nested accordions.
         if (
             scope.locator(
-                ".fl-recursive-tree-accordion a[href], .fl-recursive-tree-accordion-list .fl-accordion .fl-accordion-item"
+                ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
+                ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
             ).count()
             == 0
         ):
             _wait_links_or_subaccordions(scope, timeout=6000)
 
         # Case A: links directly under this scope
-        link_list = scope.locator(".fl-recursive-tree-accordion a[href]")
+        link_list = scope.locator(
+            ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href]"
+        )
         direct_count = 0
         try:
             direct_count = link_list.count()
@@ -588,11 +714,10 @@ def scrape_section(
                 results.append(
                     (sec_name, url, base_path + [sec_name], base_lex + [k + 1])
                 )
-            return results  # done at this depth
 
         # Case B: deeper accordions under this scope
         nested_items = scope.locator(
-            ".fl-recursive-tree-accordion-list .fl-accordion .fl-accordion-item"
+            ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
         )
         nested_count = 0
         try:
@@ -616,7 +741,7 @@ def scrape_section(
 
             # expand if collapsed
             if (n_btn.get_attribute("aria-expanded") or "").lower() != "true":
-                n_btn.evaluate("el => el.click()")
+                n_btn.click()
 
             # After expanding, wait briefly for content under this node to show up (links or more accordions)
             _wait_links_or_subaccordions(n_item, timeout=6000)
@@ -772,15 +897,32 @@ def scrape_leaf(
     soup = BeautifulSoup(response.content, "html.parser")
     statute_name = soup.select("h1")[0].get_text(strip=True)
     content_div = soup.select("div.codes-content p")[0].get_text(strip=True)
+    parsed_heading = _parse_statute_heading(statute_name, sec_name)
+    hierarchy = _build_hierarchy_metadata(
+        path_so_far,
+        lex_order,
+        state,
+        leaf_title=parsed_heading.get("article_title", ""),
+        leaf_heading=parsed_heading.get("heading", ""),
+        leaf_code=parsed_heading.get("article_code", "") or sec_name,
+    )
     statute_data = {
         "url": sec_url,
         "state": state.upper(),
         "path": "›".join(path_so_far),
+        "path_nodes": path_so_far,
+        "parent_path": "›".join(path_so_far[:-1]) if len(path_so_far) > 1 else "",
         "title": f"{state.upper()} Statutes › {' › '.join(path_so_far)}",
         "univ_cite": False,
         "citation": f"{state.upper()} Stat § {sec_name} (2023)",
+        "statute_name": statute_name,
+        "article_heading": parsed_heading.get("heading", ""),
+        "article_code": parsed_heading.get("article_code", "") or sec_name,
+        "article_title": parsed_heading.get("article_title", ""),
         "content": content_div,
         "lex_path": lex_order,
+        "hierarchy": hierarchy,
+        "parent_nodes": hierarchy["parent_nodes"],
     }
     # we write to a jsonl with the state abbreviation as the filename in the folder output_dir
     import json
@@ -798,6 +940,187 @@ import requests
 WRITE_LOCK = Lock()
 
 
+def _is_blocked_findlaw_response(response_text: str) -> bool:
+    txt = (response_text or "").lower()
+    return "just a moment" in txt or "performing security verification" in txt
+
+
+def _build_statute_record(sec_name, sec_url, path_so_far, lex_path, state, statute_name, content_div):
+    parsed_heading = _parse_statute_heading(statute_name, sec_name)
+    hierarchy = _build_hierarchy_metadata(
+        path_so_far,
+        lex_path,
+        state,
+        leaf_title=parsed_heading.get("article_title", ""),
+        leaf_heading=parsed_heading.get("heading", ""),
+        leaf_code=parsed_heading.get("article_code", "") or sec_name,
+    )
+    return {
+        "url": sec_url,
+        "state": state.upper(),
+        "path": "›".join(path_so_far),
+        "path_nodes": path_so_far,
+        "parent_path": "›".join(path_so_far[:-1]) if len(path_so_far) > 1 else "",
+        "title": f"{state.upper()} Statutes › {' › '.join(path_so_far)}",
+        "univ_cite": False,
+        "citation": f"{state.upper()} Stat § {sec_name} (2023)",
+        "statute_name": statute_name,
+        "article_heading": parsed_heading.get("heading", ""),
+        "article_code": parsed_heading.get("article_code", "") or sec_name,
+        "article_title": parsed_heading.get("article_title", ""),
+        "content": content_div,
+        "lex_path": lex_path,
+        "hierarchy": hierarchy,
+        "parent_nodes": hierarchy["parent_nodes"],
+    }
+
+
+def _write_statute_record(record_queue, f_out, data):
+    import json
+
+    line = json.dumps(data, ensure_ascii=False)
+    if record_queue is not None:
+        record_queue.put(line + "\n")
+    else:
+        with WRITE_LOCK:
+            f_out.write(line + "\n")
+
+
+def _scrape_leafs_with_playwright_fallback(work, state, output_file):
+    from playwright.sync_api import sync_playwright
+    from bs4 import BeautifulSoup
+    import json
+
+    profile_dir = os.path.join("findlaw_codes", "playwright_profile")
+    with sync_playwright() as p:
+        context = p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            viewport={"width": 1366, "height": 900},
+        )
+        page = context.pages[0] if context.pages else context.new_page()
+
+        tmp_file = f"{output_file}.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f_out:
+            for sec_name, sec_url, path_so_far, lex_path in tqdm(work, desc="Fetching (Playwright)"):
+                page.goto(sec_url, wait_until="domcontentloaded", timeout=60000)
+                page.wait_for_timeout(2000)
+                html = page.content()
+                if _is_blocked_findlaw_response(html):
+                    continue
+                soup = BeautifulSoup(html, "html.parser")
+                h1 = soup.select_one("h1")
+                if h1 is None:
+                    continue
+                statute_name = h1.get_text(strip=True)
+                content_div = clean_paragraphs(soup)
+                if not content_div:
+                    continue
+                data = _build_statute_record(
+                    sec_name,
+                    sec_url,
+                    path_so_far,
+                    lex_path,
+                    state,
+                    statute_name,
+                    content_div,
+                )
+                f_out.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+        context.close()
+        if os.path.exists(output_file):
+            os.remove(output_file)
+        os.replace(tmp_file, output_file)
+
+
+async def _scrape_leafs_with_playwright_fallback_async(page, work, state, output_file, section_url):
+    from bs4 import BeautifulSoup
+    import asyncio
+    import json
+
+    # The page/session is already validated on the section root before this fallback is called.
+    # Reuse that context to avoid losing Cloudflare/session state.
+    context = page.context
+    worker_count = max(1, min(4, len(work) // 40 + 1))
+    pages = [page]
+    for _ in range(worker_count - 1):
+        pages.append(await context.new_page())
+
+    queue = asyncio.Queue()
+    for item in work:
+        queue.put_nowait(item)
+
+    lines = []
+    lines_lock = asyncio.Lock()
+    pbar = tqdm(total=len(work), desc=f"Fetching (Playwright x{worker_count})")
+
+    async def _worker(worker_page):
+        local_lines = []
+        while True:
+            try:
+                sec_name, sec_url, path_so_far, lex_path = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            html = ""
+            blocked = True
+            for attempt in range(2):
+                await worker_page.goto(sec_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    await worker_page.wait_for_selector("h1, div.codes-content p", timeout=5000)
+                except Exception:
+                    pass
+                html = await worker_page.content()
+                blocked = _is_blocked_findlaw_response(html)
+                if not blocked:
+                    break
+                await worker_page.wait_for_timeout(800 * (attempt + 1))
+
+            if not blocked:
+                soup = BeautifulSoup(html, "html.parser")
+                h1 = soup.select_one("h1")
+                if h1 is not None:
+                    statute_name = h1.get_text(strip=True)
+                    content_div = clean_paragraphs(soup)
+                    if content_div:
+                        data = _build_statute_record(
+                            sec_name,
+                            sec_url,
+                            path_so_far,
+                            lex_path,
+                            state,
+                            statute_name,
+                            content_div,
+                        )
+                        local_lines.append(json.dumps(data, ensure_ascii=False) + "\n")
+
+            pbar.update(1)
+
+        if local_lines:
+            async with lines_lock:
+                lines.extend(local_lines)
+
+    await asyncio.gather(*(_worker(worker_page) for worker_page in pages))
+    pbar.close()
+
+    for worker_page in pages[1:]:
+        await worker_page.close()
+
+    tmp_file = f"{output_file}.tmp"
+    if len(lines) == 0:
+        if os.path.exists(tmp_file):
+            os.remove(tmp_file)
+        raise RuntimeError(f"Playwright fallback produced no records for {section_url}")
+
+    with open(tmp_file, "w", encoding="utf-8") as f_out:
+        f_out.writelines(lines)
+
+    if os.path.exists(output_file):
+        os.remove(output_file)
+    os.replace(tmp_file, output_file)
+
+
 def fetch_leaf_threadsafe(
     sec_name, sec_url, path_so_far, lex_path, state, session, f_out, record_queue=None
 ):
@@ -806,35 +1129,227 @@ def fetch_leaf_threadsafe(
         try:
             r = session.get(sec_url, timeout=30)
             if r.status_code == 200:
+                if _is_blocked_findlaw_response(r.text):
+                    break
                 soup = BeautifulSoup(r.content, "html.parser")
                 statute_name = soup.select_one("h1").get_text(strip=True)
-                content_div = soup.select_one("div.codes-content p").get_text(
-                    strip=True
+                content_div = clean_paragraphs(soup)
+                data = _build_statute_record(
+                    sec_name,
+                    sec_url,
+                    path_so_far,
+                    lex_path,
+                    state,
+                    statute_name,
+                    content_div,
                 )
-                data = {
-                    "url": sec_url,
-                    "state": state.upper(),
-                    "path": "›".join(path_so_far),
-                    "title": f"{state.upper()} Statutes › {' › '.join(path_so_far)}",
-                    "univ_cite": False,
-                    "citation": f"{state.upper()} Stat § {sec_name} (2023)",
-                    "content": content_div,
-                    "lex_path": lex_path,
-                }
-                import json
-
-                line = json.dumps(data, ensure_ascii=False)
-                if record_queue is not None:
-                    # Send to parent writer thread
-                    record_queue.put(line + "\n")
-                else:
-                    with WRITE_LOCK:
-                        f_out.write(line + "\n")
+                _write_statute_record(record_queue, f_out, data)
                 return
             time.sleep(1.5 * (attempt + 1))
         except requests.RequestException:
             time.sleep(1.5 * (attempt + 1) + random.random())
-    # (optional) log failure here
+    return
+
+async def scrape_section_url_async(section_url: str, state: str, output_file: str) -> None:
+    from queue import Queue
+    from threading import Thread
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from playwright.async_api import async_playwright
+
+    # Writer thread
+    record_q = Queue()
+    def _writer():
+        with open(output_file, "a", encoding="utf-8") as f:
+            while True:
+                item = record_q.get()
+                if item is None:
+                    break
+                f.write(item)
+    writer_t = Thread(target=_writer, daemon=True)
+    writer_t.start()
+
+    leaf_session = requests.Session()
+    leaf_session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Referer": "https://www.google.com/",
+    })
+
+    futures_list = []
+    executor = ThreadPoolExecutor(max_workers=8)
+    profile_dir = os.path.join("findlaw_codes", "playwright_profile")
+
+    async with async_playwright() as p:
+        context = await p.chromium.launch_persistent_context(
+            user_data_dir=profile_dir,
+            headless=False,
+            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+            viewport={"width": 1366, "height": 768},
+        )
+        page = context.pages[0] if context.pages else await context.new_page()
+
+        print(f"Loading {section_url} ...")
+        await page.goto(section_url, wait_until="domcontentloaded", timeout=60000)
+        found_tree = False
+        for _ in range(12):
+            if await page.locator(".fl-expandable-tree-accordion > .fl-accordion-item").count() > 0:
+                found_tree = True
+                break
+            await page.wait_for_timeout(5000)
+        if not found_tree:
+            raise RuntimeError(f"Accordion tree not visible for {section_url}")
+
+        # Collect all leaf links by expanding accordions
+        work = await _collect_links_async(page, section_url, [state.upper()], [1])
+        print(f"Found {len(work)} statutes. Fetching...")
+
+        # If the first leaf is blocked, switch the whole run to Playwright-only.
+        probe_session = requests.Session()
+        probe_session.headers.update(leaf_session.headers)
+        try:
+            probe_response = probe_session.get(work[0][1], timeout=30)
+            if probe_response.status_code != 200 or _is_blocked_findlaw_response(probe_response.text):
+                record_q.put(None)
+                writer_t.join()
+                if os.path.exists(output_file) and os.path.getsize(output_file) == 0:
+                    os.remove(output_file)
+                await _scrape_leafs_with_playwright_fallback_async(page, work, state, output_file, section_url)
+                await context.close()
+                print(f"Done. Saved to {output_file}")
+                return
+        finally:
+            probe_session.close()
+
+        await context.close()
+
+    # Submit all leaf fetches to thread pool
+    for sec_name, url, path, lex in work:
+        fut = executor.submit(
+            fetch_leaf_threadsafe,
+            sec_name, url, path, lex, state, leaf_session, None, record_q
+        )
+        futures_list.append(fut)
+
+    for _ in tqdm(as_completed(futures_list), total=len(futures_list), desc="Fetching"):
+        pass
+    executor.shutdown(wait=True)
+
+    record_q.put(None)
+    writer_t.join()
+    print(f"Done. Saved to {output_file}")
+
+
+async def _wait_links_or_subaccordions_async(scope, timeout=8000):
+    """
+    Wait briefly for either direct leaf links or direct nested accordion items
+    under the current scope. Returns True if something appears.
+    """
+    sel = (
+        ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
+        ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+    )
+    try:
+        if await scope.locator(sel).count() > 0:
+            return True
+    except Exception:
+        pass
+    try:
+        await scope.locator(sel).first.wait_for(state="attached", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+async def _collect_links_async(page, section_url: str, base_path: list, base_lex: list) -> list:
+    """Expand all accordions and collect (name, url, path, lex) tuples."""
+    from urllib.parse import urljoin
+    results = []
+
+    items = page.locator(".fl-expandable-tree-accordion > .fl-accordion-item")
+    count = await items.count()
+
+    for i in range(count):
+        item = items.nth(i)
+        btn = item.locator(":scope > h2 .fl-accordion-button")
+        await btn.wait_for(state="attached", timeout=10000)
+
+        try:
+            top_label = await btn.locator(".fl-text-left").inner_text(timeout=3000)
+            top_label = top_label.strip()
+        except Exception:
+            top_label = f"Section {i+1}"
+
+        if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
+            await btn.click()
+
+        await _wait_links_or_subaccordions_async(item, timeout=8000)
+
+        results.extend(await _collect_recursive_async(item, section_url, base_path + [top_label], base_lex + [i+1]))
+
+    return results
+
+
+async def _collect_recursive_async(scope, section_url: str, base_path: list, base_lex: list) -> list:
+    from urllib.parse import urljoin
+    results = []
+
+    # If content is still loading, wait briefly before counting.
+    await _wait_links_or_subaccordions_async(scope, timeout=8000)
+
+    # Case A: direct links
+    link_list = scope.locator(
+        ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href]"
+    )
+    direct_count = await link_list.count()
+
+    if direct_count > 0:
+        for k in range(direct_count):
+            a = link_list.nth(k)
+            sec_name = (await a.inner_text()).strip()
+            href = await a.get_attribute("href")
+            if not href:
+                continue
+            url = urljoin(section_url, href)
+            results.append((sec_name, url, base_path + [sec_name], base_lex + [k+1]))
+
+    # Case B: nested accordions
+    nested_items = scope.locator(
+        ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+    )
+    nested_count = await nested_items.count()
+
+    for j in range(nested_count):
+        n_item = nested_items.nth(j)
+        n_btn = n_item.locator("button.fl-accordion-button")
+        try:
+            await n_btn.wait_for(state="attached", timeout=3000)
+        except Exception:
+            continue
+
+        try:
+            label = await n_btn.locator(".fl-text-left").inner_text(timeout=2000)
+            label = label.strip()
+        except Exception:
+            label = f"Section {j+1}"
+
+        if (await n_btn.get_attribute("aria-expanded") or "").lower() != "true":
+            await n_btn.click()
+
+        # NEU: aktiv auf Links oder weitere nested items warten statt fixed timeout
+        try:
+            await n_item.locator(
+                ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
+                ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+            ).first.wait_for(state="attached", timeout=8000)
+        except Exception:
+            pass
+
+        results.extend(await _collect_recursive_async(
+            n_item, section_url, base_path + [label], base_lex + [j+1]
+        ))
+
+    return results
 
 
 if __name__ == "__main__":
