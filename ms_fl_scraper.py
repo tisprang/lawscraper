@@ -1189,6 +1189,26 @@ async def scrape_section_url_async(
     futures_list = []
     executor = ThreadPoolExecutor(max_workers=8)
     writer_closed = False
+    success = False
+    output_kind = os.path.splitext(os.path.basename(output_file))[0].lower()
+    la_title_filters = None
+    state_lc = state.lower()
+    section_url_lc = section_url.lower()
+
+    if state_lc == "louisiana" and "revised-statutes" in section_url_lc:
+        if output_kind == "el":
+            la_title_filters = ["Title 18. Louisiana Election Code"]
+        elif output_kind == "l":
+            la_title_filters = ["Title 24. Legislature and Laws"]
+
+    # Massachusetts special-case: both targets live on the same page, but need different title roots.
+    if state_lc == "massachusetts" and "codes.findlaw.com/ma/" in section_url_lc:
+        if output_kind == "el":
+            la_title_filters = ["Title VIII. Elections"]
+        elif output_kind == "l":
+            la_title_filters = [
+                "Title I. Jurisdiction and Emblems of the Commonwealth"
+            ]
 
     def _close_writer_once():
         nonlocal writer_closed
@@ -1197,74 +1217,112 @@ async def scrape_section_url_async(
         record_q.put(None)
         writer_t.join()
         writer_closed = True
+
+    def _cleanup_failed_output() -> None:
+        if not os.path.exists(output_file):
+            return
+        try:
+            if not _jsonl_has_any_record(output_file):
+                os.remove(output_file)
+        except Exception:
+            pass
     profile_dir = os.path.join("findlaw_codes", "playwright_profile")
 
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=profile_dir,
-            headless=False,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
-            viewport={"width": 1366, "height": 768},
-        )
-        page = context.pages[0] if context.pages else await context.new_page()
+    try:
+        async with async_playwright() as p:
+            context = await p.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                headless=False,
+                args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+                viewport={"width": 1366, "height": 768},
+            )
+            page = context.pages[0] if context.pages else await context.new_page()
 
-        print(f"Loading {section_url} ...")
-        await page.goto(section_url, wait_until="domcontentloaded", timeout=60000)
-        found_tree = await _wait_for_findlaw_ready_async(
-            page,
-            section_url,
-            tree_selector=".fl-expandable-tree-accordion > .fl-accordion-item",
-            timeout_ms=240000,
-        )
-        if not found_tree:
-            raise RuntimeError(f"Accordion tree not visible for {section_url}")
+            print(f"Loading {section_url} ...")
+            await page.goto(section_url, wait_until="domcontentloaded", timeout=60000)
+            found_tree = await _wait_for_findlaw_ready_async(
+                page,
+                section_url,
+                tree_selector=".fl-expandable-tree-accordion > .fl-accordion-item",
+                timeout_ms=240000,
+            )
+            if not found_tree:
+                raise RuntimeError(f"Accordion tree not visible for {section_url}")
 
-        # Collect all leaf links by expanding accordions
-        work = await _collect_links_async(
-            page,
-            section_url,
-            [state.upper()],
-            [1],
-            max_collect_seconds=None if require_complete_tree else 300.0,
-            require_complete_tree=require_complete_tree,
-        )
-        if not work:
-            raise RuntimeError(f"No statute links found after expanding accordions for {section_url}")
-        print(f"Found {len(work)} statutes. Fetching...")
+            # Collect all leaf links by expanding accordions
+            work = await _collect_links_async(
+                page,
+                section_url,
+                [state.upper()],
+                [1],
+                max_collect_seconds=None if require_complete_tree else 300.0,
+                require_complete_tree=require_complete_tree,
+                top_level_title_filters=la_title_filters,
+            )
+            if not work:
+                raise RuntimeError(f"No statute links found after expanding accordions for {section_url}")
 
-        # If the first leaf is blocked, switch the whole run to Playwright-only.
-        probe_session = requests.Session()
-        probe_session.headers.update(leaf_session.headers)
+            raw_count = len(work)
+            work = _dedupe_work_items(work)
+            unique_count = len(work)
+            if unique_count == 0:
+                raise RuntimeError(f"No unique statute links found after expansion for {section_url}")
+
+            if unique_count != raw_count:
+                print(
+                    f"Collected {raw_count} leaf entries ({unique_count} unique URLs after dedup)."
+                )
+            print(f"Found {unique_count} statutes. Fetching...")
+
+            # If the first leaf is blocked, switch the whole run to Playwright-only.
+            probe_session = requests.Session()
+            probe_session.headers.update(leaf_session.headers)
+            try:
+                probe_response = probe_session.get(work[0][1], timeout=30)
+                if probe_response.status_code != 200 or _is_blocked_findlaw_response(probe_response.text):
+                    _close_writer_once()
+                    _cleanup_failed_output()
+                    await _scrape_leafs_with_playwright_fallback_async(page, work, state, output_file, section_url)
+                    success = _jsonl_has_any_record(output_file)
+                    await context.close()
+                    print(f"Done. Saved to {output_file}")
+                    return
+            finally:
+                probe_session.close()
+
+            await context.close()
+
+        # Submit all leaf fetches to thread pool
+        for sec_name, url, path, lex in work:
+            fut = executor.submit(
+                fetch_leaf_threadsafe,
+                sec_name, url, path, lex, state, leaf_session, None, record_q
+            )
+            futures_list.append(fut)
+
+        total_fetch = len(futures_list)
+        done_fetch = 0
+        print(f"Fetch progress: 0/{total_fetch}")
+        for _ in tqdm(as_completed(futures_list), total=total_fetch, desc="Fetching"):
+            done_fetch += 1
+            if done_fetch % 100 == 0 or done_fetch == total_fetch:
+                print(f"Fetch progress: {done_fetch}/{total_fetch}")
+        success = True
+    finally:
         try:
-            probe_response = probe_session.get(work[0][1], timeout=30)
-            if probe_response.status_code != 200 or _is_blocked_findlaw_response(probe_response.text):
-                _close_writer_once()
-                if os.path.exists(output_file) and os.path.getsize(output_file) == 0:
-                    os.remove(output_file)
-                await _scrape_leafs_with_playwright_fallback_async(page, work, state, output_file, section_url)
-                await context.close()
-                print(f"Done. Saved to {output_file}")
-                return
-        finally:
-            probe_session.close()
+            executor.shutdown(wait=True)
+        except Exception:
+            pass
+        _close_writer_once()
+        if not success:
+            _cleanup_failed_output()
+        if success and not _jsonl_has_any_record(output_file):
+            _cleanup_failed_output()
+            success = False
 
-        await context.close()
+    if not success:
+        raise RuntimeError(f"Scrape produced no records for {section_url}")
 
-    # Submit all leaf fetches to thread pool
-    for sec_name, url, path, lex in work:
-        fut = executor.submit(
-            fetch_leaf_threadsafe,
-            sec_name, url, path, lex, state, leaf_session, None, record_q
-        )
-        futures_list.append(fut)
-
-    for _ in tqdm(as_completed(futures_list), total=len(futures_list), desc="Fetching"):
-        pass
-    executor.shutdown(wait=True)
-
-    _close_writer_once()
-    if os.path.exists(output_file) and os.path.getsize(output_file) == 0:
-        os.remove(output_file)
     print(f"Done. Saved to {output_file}")
 
 
@@ -1303,6 +1361,8 @@ async def _wait_for_findlaw_ready_async(page, section_url: str, tree_selector: s
         "cloudflare",
     )
     last_log_ts = 0.0
+    stagnant_rounds = 0
+    prev_dom_signature = ""
 
     while time.time() < deadline:
         try:
@@ -1312,9 +1372,46 @@ async def _wait_for_findlaw_ready_async(page, section_url: str, tree_selector: s
             pass
 
         try:
-            body_text = (await page.locator("body").inner_text(timeout=2000)).lower()
+            # Broader readiness for very large FindLaw pages where first tree node appears late.
+            if await page.locator("button.fl-accordion-button").count() > 0:
+                return True
+            if await page.locator(".fl-recursive-tree-accordion a[href]").count() > 0:
+                return True
+        except Exception:
+            pass
+
+        try:
+            # Avoid expensive body.inner_text() on huge pages.
+            body_text = await page.evaluate(
+                """
+                () => {
+                  const t = (document.body && document.body.textContent) ? document.body.textContent : '';
+                  return t.slice(0, 12000).toLowerCase();
+                }
+                """
+            )
         except Exception:
             body_text = ""
+
+        try:
+            dom_signature = await page.evaluate(
+                """
+                () => {
+                  const acc = document.querySelectorAll('button.fl-accordion-button').length;
+                  const links = document.querySelectorAll('.fl-recursive-tree-accordion a[href]').length;
+                  const spinner = document.querySelectorAll('.loading,.spinner,.fl-loading').length;
+                  return `${acc}|${links}|${spinner}|${document.body ? document.body.scrollHeight : 0}`;
+                }
+                """
+            )
+        except Exception:
+            dom_signature = ""
+
+        if dom_signature == prev_dom_signature:
+            stagnant_rounds += 1
+        else:
+            stagnant_rounds = 0
+            prev_dom_signature = dom_signature
 
         current_url = page.url or ""
         in_challenge = (
@@ -1329,6 +1426,17 @@ async def _wait_for_findlaw_ready_async(page, section_url: str, tree_selector: s
             except Exception:
                 pass
 
+        # Recovery for "content loading" stalls on huge pages (e.g., Louisiana code root).
+        if not in_challenge and stagnant_rounds >= 6:
+            try:
+                print("FindLaw page appears stalled; reloading to resume rendering...")
+                await page.reload(wait_until="domcontentloaded", timeout=60000)
+                stagnant_rounds = 0
+                prev_dom_signature = ""
+                await page.wait_for_timeout(2000)
+            except Exception:
+                pass
+
         now = time.time()
         if now - last_log_ts > 12:
             status = "Cloudflare challenge" if in_challenge else "content loading"
@@ -1338,6 +1446,36 @@ async def _wait_for_findlaw_ready_async(page, section_url: str, tree_selector: s
         await page.wait_for_timeout(2000)
 
     return False
+
+
+def _jsonl_has_any_record(path: str) -> bool:
+    if not os.path.exists(path):
+        return False
+    if os.path.getsize(path) == 0:
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    return True
+    except Exception:
+        return False
+    return False
+
+
+def _dedupe_work_items(work: list) -> list:
+    """Keep first occurrence per URL to avoid duplicate fetches from repeated DOM branches."""
+    seen = set()
+    out = []
+    for item in work:
+        if len(item) < 2:
+            continue
+        url = item[1]
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        out.append(item)
+    return out
 
 
 async def _expand_all_accordions_async(
@@ -1456,6 +1594,93 @@ async def _force_click_closed_accordions_async(page, limit: int = 25) -> int:
     return clicked
 
 
+async def _get_top_level_items_async(page, title_filters: Optional[List[str]] = None):
+    items = page.locator(".fl-expandable-tree-accordion > .fl-accordion-item")
+    count = await items.count()
+    out = []
+    wanted = [w.lower() for w in (title_filters or [])]
+
+    for i in range(count):
+        item = items.nth(i)
+        btn = item.locator(
+            ":scope > h2 .fl-accordion-button, "
+            ":scope > h3 .fl-accordion-button, "
+            ":scope > button.fl-accordion-button"
+        ).first
+        if await btn.count() == 0:
+            continue
+        try:
+            label = await btn.locator(".fl-text-left").first.inner_text(timeout=3000)
+            label = label.strip()
+        except Exception:
+            label = f"Section {i+1}"
+
+        if wanted and not any(w in label.lower() for w in wanted):
+            continue
+
+        out.append((i, item, label))
+
+    return out
+
+
+async def _get_scope_stats_async(scope) -> Dict[str, int]:
+    stats = await scope.evaluate(
+        """
+        (root) => {
+          const allButtons = Array.from(root.querySelectorAll('button.fl-accordion-button'));
+          const closedButtons = allButtons.filter(btn => (btn.getAttribute('aria-expanded') || '').toLowerCase() !== 'true');
+          const links = Array.from(root.querySelectorAll('.fl-recursive-tree-accordion a[href]'));
+          return {
+            closed_buttons: closedButtons.length,
+            visible_links: links.length,
+          };
+        }
+        """
+    )
+    return {
+        "closed_buttons": int(stats.get("closed_buttons", 0)),
+        "visible_links": int(stats.get("visible_links", 0)),
+    }
+
+
+async def _expand_scope_accordions_async(scope, max_cycles: int = 200) -> None:
+    for _ in range(max_cycles):
+        outcome = await scope.evaluate(
+            """
+            (root) => {
+              const buttons = Array.from(root.querySelectorAll('button.fl-accordion-button[aria-expanded="false"]'));
+              let clicked = 0;
+              const batch = 80;
+              for (const btn of buttons.slice(0, batch)) {
+                try {
+                  btn.scrollIntoView({ block: 'center', inline: 'nearest' });
+                  btn.click();
+                  clicked += 1;
+                } catch (_e) {
+                }
+              }
+              return { clicked, remaining: buttons.length };
+            }
+            """
+        )
+        clicked = int(outcome.get("clicked", 0))
+        remaining = int(outcome.get("remaining", 0))
+        if clicked == 0 or remaining == 0:
+            break
+        await scope.evaluate("(root) => new Promise(resolve => setTimeout(resolve, 600))")
+
+
+async def _collect_scope_visible_urls_async(scope) -> set:
+    hrefs = await scope.evaluate(
+        """
+        (root) => Array.from(root.querySelectorAll('.fl-recursive-tree-accordion a[href]'))
+          .map(a => a.href)
+          .filter(Boolean)
+        """
+    )
+    return set(hrefs)
+
+
 async def _collect_links_async(
     page,
     section_url: str,
@@ -1463,6 +1688,7 @@ async def _collect_links_async(
     base_lex: list,
     max_collect_seconds: Optional[float] = 300.0,
     require_complete_tree: bool = False,
+    top_level_title_filters: Optional[List[str]] = None,
 ) -> list:
     """Expand all accordions and collect (name, url, path, lex) tuples."""
     from urllib.parse import urljoin
@@ -1473,59 +1699,70 @@ async def _collect_links_async(
 
     # In completeness mode, loop expand+collect until URL set stabilizes.
     if require_complete_tree:
-        seen_urls = set()
+        seen_visible_urls = set()
         stable_rounds = 0
         round_idx = 0
         previous_closed_buttons = None
-        while True:
-            round_idx += 1
-            await _expand_all_accordions_async(
-                page,
-                max_passes=260,
-                time_budget_s=None,
-                stable_rounds_target=14,
+        max_rounds = 40
+
+        top_level_items = await _get_top_level_items_async(page, top_level_title_filters)
+        if top_level_title_filters and not top_level_items:
+            raise RuntimeError(
+                f"No matching top-level accordion found for filters: {top_level_title_filters}"
             )
 
-            stats_after_expand = await _get_accordion_stats_async(page)
-            if stats_after_expand["closed_buttons"] > 0:
-                forced_clicks = await _force_click_closed_accordions_async(page, limit=30)
-                if forced_clicks > 0:
-                    await page.wait_for_timeout(1200)
-                    stats_after_expand = await _get_accordion_stats_async(page)
+        while True:
+            round_idx += 1
+            print(f"Collect round {round_idx}: expanding accordion tree...")
 
-            round_links = []
-            items = page.locator(".fl-expandable-tree-accordion > .fl-accordion-item")
-            count = await items.count()
-            for i in range(count):
-                item = items.nth(i)
-                btn = item.locator(":scope > h2 .fl-accordion-button")
-                await btn.wait_for(state="attached", timeout=15000)
-
-                try:
-                    top_label = await btn.locator(".fl-text-left").inner_text(timeout=3000)
-                    top_label = top_label.strip()
-                except Exception:
-                    top_label = f"Section {i+1}"
-
-                if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
-                    await btn.click()
-
-                await _wait_links_or_subaccordions_async(item, timeout=8000)
-                round_links.extend(
-                    await _collect_recursive_async(
-                        item,
-                        section_url,
-                        base_path + [top_label],
-                        base_lex + [i + 1],
-                        None,
+            if top_level_items:
+                current_visible_urls = set()
+                closed_buttons = 0
+                for _, item, label in top_level_items:
+                    btn = item.locator(
+                        ":scope > h2 .fl-accordion-button, "
+                        ":scope > h3 .fl-accordion-button, "
+                        ":scope > button.fl-accordion-button"
+                    ).first
+                    if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
+                        await btn.click()
+                    await _wait_links_or_subaccordions_async(item, timeout=12000)
+                    await _expand_scope_accordions_async(item, max_cycles=260)
+                    scoped_stats = await _get_scope_stats_async(item)
+                    closed_buttons += scoped_stats["closed_buttons"]
+                    current_visible_urls.update(await _collect_scope_visible_urls_async(item))
+                    print(
+                        f"  Scoped title '{label}': {scoped_stats['visible_links']} visible links, {scoped_stats['closed_buttons']} closed buttons."
                     )
+            else:
+                await _expand_all_accordions_async(
+                    page,
+                    max_passes=260,
+                    time_budget_s=None,
+                    stable_rounds_target=14,
                 )
 
-            current_urls = {u for _, u, _, _ in round_links}
-            new_urls = len(current_urls - seen_urls)
-            closed_buttons = stats_after_expand["closed_buttons"]
+                stats_after_expand = await _get_accordion_stats_async(page)
+                if stats_after_expand["closed_buttons"] > 0:
+                    forced_clicks = await _force_click_closed_accordions_async(page, limit=30)
+                    if forced_clicks > 0:
+                        await page.wait_for_timeout(1200)
+                        stats_after_expand = await _get_accordion_stats_async(page)
+
+                current_visible_urls = set(
+                    await page.evaluate(
+                        """
+                        () => Array.from(document.querySelectorAll('.fl-recursive-tree-accordion a[href]'))
+                          .map(a => a.href)
+                          .filter(Boolean)
+                        """
+                    )
+                )
+                closed_buttons = stats_after_expand["closed_buttons"]
+
+            new_urls = len(current_visible_urls - seen_visible_urls)
             print(
-                f"Collect round {round_idx}: {len(current_urls)} unique links ({new_urls} new), {closed_buttons} closed accordion buttons left."
+                f"Collect round {round_idx}: {len(current_visible_urls)} visible links ({new_urls} new), {closed_buttons} closed accordion buttons left."
             )
 
             no_progress = new_urls == 0
@@ -1537,13 +1774,45 @@ async def _collect_links_async(
             else:
                 stable_rounds = 0
 
-            seen_urls = current_urls
-            results = round_links
+            seen_visible_urls = current_visible_urls
             previous_closed_buttons = closed_buttons
 
             if stable_rounds >= 2:
                 print("Link set stabilized. Proceeding to fetch all collected statutes.")
-                return results
+                break
+
+            if round_idx >= max_rounds:
+                print("Maximum collect rounds reached; proceeding with best-effort fully expanded state.")
+                break
+
+        # Single deep traversal after stabilization/max rounds to build full path metadata once.
+        print("Starting final deep link traversal...")
+        traversal_items = top_level_items if top_level_items else await _get_top_level_items_async(page, None)
+        count = len(traversal_items)
+        for pos, (i, item, top_label) in enumerate(traversal_items, start=1):
+            btn = item.locator(
+                ":scope > h2 .fl-accordion-button, "
+                ":scope > h3 .fl-accordion-button, "
+                ":scope > button.fl-accordion-button"
+            ).first
+            await btn.wait_for(state="attached", timeout=15000)
+
+            if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
+                await btn.click()
+
+            await _wait_links_or_subaccordions_async(item, timeout=8000)
+            results.extend(
+                await _collect_recursive_async(
+                    item,
+                    section_url,
+                    base_path + [top_label],
+                    base_lex + [i + 1],
+                    None,
+                )
+            )
+            print(f"Final traversal progress: top-level {pos}/{count} ({top_label})")
+
+        return results
 
     # Timed mode for non-strict runs.
     await _expand_all_accordions_async(page, max_passes=120, time_budget_s=35.0)
@@ -1552,23 +1821,23 @@ async def _collect_links_async(
         print("Link collection deadline reached before traversal started.")
         return results
 
-    items = page.locator(".fl-expandable-tree-accordion > .fl-accordion-item")
-    count = await items.count()
+    traversal_items = await _get_top_level_items_async(page, top_level_title_filters)
+    if top_level_title_filters and not traversal_items:
+        raise RuntimeError(
+            f"No matching top-level accordion found for filters: {top_level_title_filters}"
+        )
 
-    for i in range(count):
+    for i, item, top_label in traversal_items:
         if deadline_ts is not None and time.time() >= deadline_ts:
             print("Link collection deadline reached; starting fetch with partial link set.")
             break
 
-        item = items.nth(i)
-        btn = item.locator(":scope > h2 .fl-accordion-button")
+        btn = item.locator(
+            ":scope > h2 .fl-accordion-button, "
+            ":scope > h3 .fl-accordion-button, "
+            ":scope > button.fl-accordion-button"
+        ).first
         await btn.wait_for(state="attached", timeout=10000)
-
-        try:
-            top_label = await btn.locator(".fl-text-left").inner_text(timeout=3000)
-            top_label = top_label.strip()
-        except Exception:
-            top_label = f"Section {i+1}"
 
         if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
             await btn.click()
