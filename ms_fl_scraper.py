@@ -1210,6 +1210,16 @@ async def scrape_section_url_async(
                 "Title I. Jurisdiction and Emblems of the Commonwealth"
             ]
 
+    # Texas special-case: for l.jsonl only scrape the legislative title subtree.
+    if state_lc == "texas" and "codes.findlaw.com/tx/" in section_url_lc:
+        if output_kind == "l":
+            la_title_filters = ["Title 3. Legislative Branch"]
+
+    # New Jersey special-case: for l.jsonl only scrape Subtitle 2 Legislature.
+    if state_lc == "new jersey" and "codes.findlaw.com/nj/" in section_url_lc:
+        if output_kind == "l":
+            la_title_filters = ["Subtitle 2. Legislature"]
+
     def _close_writer_once():
         nonlocal writer_closed
         if writer_closed:
