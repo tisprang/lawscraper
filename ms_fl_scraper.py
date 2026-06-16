@@ -996,6 +996,8 @@ def _scrape_leafs_with_playwright_fallback(work, state, output_file):
     import json
 
     profile_dir = os.path.join("findlaw_codes", "playwright_profile")
+    if state_lc == "california" and output_kind == "l":
+        profile_dir = os.path.join("findlaw_codes", "playwright_profile_ca_l")
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
@@ -1042,6 +1044,7 @@ async def _scrape_leafs_with_playwright_fallback_async(page, work, state, output
     from bs4 import BeautifulSoup
     import asyncio
     import json
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
     # The page/session is already validated on the section root before this fallback is called.
     # Reuse that context to avoid losing Cloudflare/session state.
@@ -1070,7 +1073,15 @@ async def _scrape_leafs_with_playwright_fallback_async(page, work, state, output
             html = ""
             blocked = True
             for attempt in range(2):
-                await worker_page.goto(sec_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    await worker_page.goto(sec_url, wait_until="domcontentloaded", timeout=45000)
+                except PlaywrightTimeoutError:
+                    # Skip hard-stalled leaves instead of aborting the entire fallback run.
+                    await worker_page.wait_for_timeout(1000 * (attempt + 1))
+                    continue
+                except Exception:
+                    await worker_page.wait_for_timeout(1000 * (attempt + 1))
+                    continue
                 try:
                     await worker_page.wait_for_selector("h1, div.codes-content p", timeout=5000)
                 except Exception:
@@ -1219,6 +1230,11 @@ async def scrape_section_url_async(
     if state_lc == "new jersey" and "codes.findlaw.com/nj/" in section_url_lc:
         if output_kind == "l":
             la_title_filters = ["Subtitle 2. Legislature"]
+
+    # California special-case: for l.jsonl only scrape Title 2.
+    if state_lc == "california" and "codes.findlaw.com/ca/" in section_url_lc:
+        if output_kind == "l":
+            la_title_filters = ["Title 2. Government of the State of California"]
 
     def _close_writer_once():
         nonlocal writer_closed
@@ -1907,10 +1923,13 @@ async def _collect_recursive_async(
             url = urljoin(section_url, href)
             results.append((sec_name, url, base_path + [sec_name], base_lex + [k+1]))
 
-    # Case B: nested accordions
-    nested_items = scope.locator(
-        ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+    # Case B: nested accordions (direct children of this scope)
+    nested_selector = (
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion-item"
     )
+    nested_items = scope.locator(nested_selector)
     nested_count = await nested_items.count()
 
     # Some branches render one level later; retry once before concluding this node is a leaf.
@@ -1923,43 +1942,64 @@ async def _collect_recursive_async(
         direct_count = await link_list.count()
         nested_count = await nested_items.count()
 
-    for j in range(nested_count):
+    # Dynamic pages may inject siblings after expansion; keep discovering unseen children.
+    processed_child_ids = set()
+    while True:
         if deadline_ts is not None and time.time() >= deadline_ts:
             break
 
-        n_item = nested_items.nth(j)
-        n_btn = n_item.locator(
-            ":scope > h2 .fl-accordion-button, "
-            ":scope > h3 .fl-accordion-button, "
-            ":scope > button.fl-accordion-button"
-        ).first
-        if await n_btn.count() == 0:
-            continue
+        nested_items = scope.locator(nested_selector)
+        nested_count = await nested_items.count()
+        progressed = False
 
-        try:
-            label = await n_btn.locator(".fl-text-left").first.inner_text(timeout=2000)
-            label = label.strip()
-        except Exception:
-            label = f"Section {j+1}"
+        for j in range(nested_count):
+            if deadline_ts is not None and time.time() >= deadline_ts:
+                break
 
-        if (await n_btn.get_attribute("aria-expanded") or "").lower() != "true":
-            await n_btn.click()
+            n_item = nested_items.nth(j)
+            item_id = await n_item.get_attribute("id")
+            if item_id and item_id in processed_child_ids:
+                continue
 
-        if deadline_ts is None:
-            wait_ms = 6000
-        else:
-            wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
-        await _wait_links_or_subaccordions_async(n_item, timeout=wait_ms)
+            n_btn = n_item.locator(
+                ":scope > h2 .fl-accordion-button, "
+                ":scope > h3 .fl-accordion-button, "
+                ":scope > button.fl-accordion-button"
+            ).first
+            if await n_btn.count() == 0:
+                continue
 
-        results.extend(
-            await _collect_recursive_async(
-                n_item,
-                section_url,
-                base_path + [label],
-                base_lex + [j + 1],
-                deadline_ts,
+            if item_id:
+                processed_child_ids.add(item_id)
+            progressed = True
+
+            try:
+                label = await n_btn.locator(".fl-text-left").first.inner_text(timeout=2000)
+                label = label.strip()
+            except Exception:
+                label = f"Section {j+1}"
+
+            if (await n_btn.get_attribute("aria-expanded") or "").lower() != "true":
+                await n_btn.click()
+
+            if deadline_ts is None:
+                wait_ms = 6000
+            else:
+                wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
+            await _wait_links_or_subaccordions_async(n_item, timeout=wait_ms)
+
+            results.extend(
+                await _collect_recursive_async(
+                    n_item,
+                    section_url,
+                    base_path + [label],
+                    base_lex + [j + 1],
+                    deadline_ts,
+                )
             )
-        )
+
+        if not progressed:
+            break
 
     return results
 
