@@ -14,7 +14,7 @@ import re
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from multiprocessing import get_context
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from urllib.parse import urljoin
 
 import requests
@@ -996,8 +996,6 @@ def _scrape_leafs_with_playwright_fallback(work, state, output_file):
     import json
 
     profile_dir = os.path.join("findlaw_codes", "playwright_profile")
-    if state_lc == "california" and output_kind == "l":
-        profile_dir = os.path.join("findlaw_codes", "playwright_profile_ca_l")
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             user_data_dir=profile_dir,
@@ -1203,6 +1201,7 @@ async def scrape_section_url_async(
     success = False
     output_kind = os.path.splitext(os.path.basename(output_file))[0].lower()
     la_title_filters = None
+    path_filter = None
     state_lc = state.lower()
     section_url_lc = section_url.lower()
 
@@ -1231,10 +1230,20 @@ async def scrape_section_url_async(
         if output_kind == "l":
             la_title_filters = ["Subtitle 2. Legislature"]
 
-    # California special-case: for l.jsonl only scrape Title 2.
-    if state_lc == "california" and "codes.findlaw.com/ca/" in section_url_lc:
+    # California special-case: for l.jsonl only scrape Title 2, then keep only Division 2.
+    if state_lc == "california" and "codes.findlaw.com/ca/government-code/" in section_url_lc:
         if output_kind == "l":
             la_title_filters = ["Title 2. Government of the State of California"]
+            def path_filter(path: List[str]) -> bool:
+                path_lc = [part.lower() for part in path]
+                has_title_2 = any(
+                    "title 2. government of the state of california" in part for part in path_lc
+                )
+                if not has_title_2:
+                    return False
+                if len(path_lc) <= 2:
+                    return True
+                return any(part.startswith("division 2") for part in path_lc)
 
     def _close_writer_once():
         nonlocal writer_closed
@@ -1284,6 +1293,7 @@ async def scrape_section_url_async(
                 max_collect_seconds=None if require_complete_tree else 300.0,
                 require_complete_tree=require_complete_tree,
                 top_level_title_filters=la_title_filters,
+                path_filter=path_filter,
             )
             if not work:
                 raise RuntimeError(f"No statute links found after expanding accordions for {section_url}")
@@ -1715,6 +1725,7 @@ async def _collect_links_async(
     max_collect_seconds: Optional[float] = 300.0,
     require_complete_tree: bool = False,
     top_level_title_filters: Optional[List[str]] = None,
+    path_filter: Optional[Callable[[List[str]], bool]] = None,
 ) -> list:
     """Expand all accordions and collect (name, url, path, lex) tuples."""
     from urllib.parse import urljoin
@@ -1753,7 +1764,8 @@ async def _collect_links_async(
                     if (await btn.get_attribute("aria-expanded") or "").lower() != "true":
                         await btn.click()
                     await _wait_links_or_subaccordions_async(item, timeout=12000)
-                    await _expand_scope_accordions_async(item, max_cycles=260)
+                    if path_filter is None:
+                        await _expand_scope_accordions_async(item, max_cycles=260)
                     scoped_stats = await _get_scope_stats_async(item)
                     closed_buttons += scoped_stats["closed_buttons"]
                     current_visible_urls.update(await _collect_scope_visible_urls_async(item))
@@ -1834,6 +1846,7 @@ async def _collect_links_async(
                     base_path + [top_label],
                     base_lex + [i + 1],
                     None,
+                    path_filter=path_filter,
                 )
             )
             print(f"Final traversal progress: top-level {pos}/{count} ({top_label})")
@@ -1881,6 +1894,7 @@ async def _collect_links_async(
                 base_path + [top_label],
                 base_lex + [i + 1],
                 deadline_ts,
+                    path_filter=path_filter,
             )
         )
 
@@ -1893,6 +1907,7 @@ async def _collect_recursive_async(
     base_path: list,
     base_lex: list,
     deadline_ts: Optional[float],
+    path_filter: Optional[Callable[[List[str]], bool]] = None,
 ) -> list:
     from urllib.parse import urljoin
     results = []
@@ -1921,7 +1936,10 @@ async def _collect_recursive_async(
             if not href:
                 continue
             url = urljoin(section_url, href)
-            results.append((sec_name, url, base_path + [sec_name], base_lex + [k+1]))
+            candidate_path = base_path + [sec_name]
+            if path_filter and not path_filter(candidate_path):
+                continue
+            results.append((sec_name, url, candidate_path, base_lex + [k+1]))
 
     # Case B: nested accordions (direct children of this scope)
     nested_selector = (
@@ -1979,6 +1997,10 @@ async def _collect_recursive_async(
             except Exception:
                 label = f"Section {j+1}"
 
+            candidate_path = base_path + [label]
+            if path_filter and not path_filter(candidate_path):
+                continue
+
             if (await n_btn.get_attribute("aria-expanded") or "").lower() != "true":
                 await n_btn.click()
 
@@ -1992,9 +2014,10 @@ async def _collect_recursive_async(
                 await _collect_recursive_async(
                     n_item,
                     section_url,
-                    base_path + [label],
+                    candidate_path,
                     base_lex + [j + 1],
                     deadline_ts,
+                    path_filter=path_filter,
                 )
             )
 
