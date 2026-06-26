@@ -630,7 +630,14 @@ def _wait_links_or_subaccordions(scope, timeout=6000):
     """
     sel = (
         ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
-        ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+        ":scope > .fl-accordion-content > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item"
     )
     # fast path: anything already there?
     try:
@@ -687,7 +694,14 @@ def scrape_section(
         if (
             scope.locator(
                 ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
-                ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+                ":scope > .fl-accordion-content > .fl-accordion-item, "
+                ":scope > .fl-accordion-content > .fl-accordion > .fl-accordion-item, "
+                ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion-item, "
+                ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion > .fl-accordion-item, "
+                ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+                ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
+                ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+                ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item"
             ).count()
             == 0
         ):
@@ -717,7 +731,14 @@ def scrape_section(
 
         # Case B: deeper accordions under this scope
         nested_items = scope.locator(
-            ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+            ":scope > .fl-accordion-content > .fl-accordion-item, "
+            ":scope > .fl-accordion-content > .fl-accordion > .fl-accordion-item, "
+            ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion-item, "
+            ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion > .fl-accordion-item, "
+            ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+            ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
+            ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+            ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item"
         )
         nested_count = 0
         try:
@@ -1245,6 +1266,11 @@ async def scrape_section_url_async(
                     return True
                 return any(part.startswith("division 2") for part in path_lc)
 
+    # Delaware special-case: for l.jsonl only scrape Part II (The General Assembly).
+    if state_lc == "delaware" and "codes.findlaw.com/de/title-29-state-government/" in section_url_lc:
+        if output_kind == "l":
+            la_title_filters = ["Part II. The General Assembly"]
+
     def _close_writer_once():
         nonlocal writer_closed
         if writer_closed:
@@ -1369,7 +1395,14 @@ async def _wait_links_or_subaccordions_async(scope, timeout=8000):
     """
     sel = (
         ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href], "
-        ":scope > .fl-accordion-content .fl-recursive-tree-accordion-list .fl-accordion-item"
+        ":scope > .fl-accordion-content > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item"
     )
     try:
         if await scope.locator(sel).count() > 0:
@@ -1717,6 +1750,46 @@ async def _collect_scope_visible_urls_async(scope) -> set:
     return set(hrefs)
 
 
+async def _collect_direct_leaf_links_async(scope) -> List[Dict[str, str]]:
+        """Collect direct leaf links only (exclude links under child accordion-items)."""
+        links = await scope.evaluate(
+                """
+                (root) => {
+                    const content = root.querySelector(':scope > .fl-accordion-content') || root;
+                    const anchors = Array.from(content.querySelectorAll('a[href]'));
+                    const out = [];
+
+                    for (const a of anchors) {
+                        let p = a.parentElement;
+                        let insideChildAccordionItem = false;
+                        while (p && p !== content) {
+                            if (p.classList && p.classList.contains('fl-accordion-item')) {
+                                insideChildAccordionItem = true;
+                                break;
+                            }
+                            p = p.parentElement;
+                        }
+                        if (insideChildAccordionItem) {
+                            continue;
+                        }
+
+                        const href = a.getAttribute('href') || a.href || '';
+                        if (!href) {
+                            continue;
+                        }
+
+                        out.push({
+                            text: (a.textContent || '').trim(),
+                            href,
+                        });
+                    }
+                    return out;
+                }
+                """
+        )
+        return links or []
+
+
 async def _collect_links_async(
     page,
     section_url: str,
@@ -1922,17 +1995,14 @@ async def _collect_recursive_async(
         wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
     await _wait_links_or_subaccordions_async(scope, timeout=wait_ms)
 
-    # Case A: direct links
-    link_list = scope.locator(
-        ":scope > .fl-accordion-content .fl-recursive-tree-accordion a[href]"
-    )
-    direct_count = await link_list.count()
+    # Case A: direct links (only at current depth; deeper accordion descendants are excluded)
+    direct_links = await _collect_direct_leaf_links_async(scope)
+    direct_count = len(direct_links)
 
     if direct_count > 0:
-        for k in range(direct_count):
-            a = link_list.nth(k)
-            sec_name = (await a.inner_text()).strip()
-            href = await a.get_attribute("href")
+        for k, link in enumerate(direct_links):
+            sec_name = (link.get("text") or "").strip() or f"Section {k+1}"
+            href = (link.get("href") or "").strip()
             if not href:
                 continue
             url = urljoin(section_url, href)
@@ -1943,9 +2013,14 @@ async def _collect_recursive_async(
 
     # Case B: nested accordions (direct children of this scope)
     nested_selector = (
-        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-accordion > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
         ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item, "
-        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion-list > .fl-accordion-item"
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion-item, "
+        ":scope > .fl-accordion-content > .fl-recursive-tree-accordion > .fl-recursive-tree-accordion-list > .fl-accordion > .fl-accordion-item"
     )
     nested_items = scope.locator(nested_selector)
     nested_count = await nested_items.count()
@@ -1957,7 +2032,8 @@ async def _collect_recursive_async(
         else:
             wait_ms = int(max(500, min(6000, (deadline_ts - time.time()) * 1000)))
         await _wait_links_or_subaccordions_async(scope, timeout=wait_ms)
-        direct_count = await link_list.count()
+        direct_links = await _collect_direct_leaf_links_async(scope)
+        direct_count = len(direct_links)
         nested_count = await nested_items.count()
 
     # Dynamic pages may inject siblings after expansion; keep discovering unseen children.
